@@ -1,0 +1,1239 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -107,6 +107,8 @@ bsd/dev/random/randomdev.c		standard
+ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
++bsd/dev/a72q_touch_11215.c		standard
++bsd/dev/a72q_display_11215.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/a72q_touch_11215.c b/bsd/dev/a72q_touch_11215.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..0000000000000000000000000000000000000000
+--- /dev/null
++++ b/bsd/dev/a72q_touch_11215.c
+@@ -0,0 +1,736 @@
++/*
++ * A72Q GENI SE7 touch bring-up: Zinitix ZT7650 @0x20 or STM FTS5CU56A @0x49.
++ * Ported to xnu-11215 (Bergamota) from the xnu-8796 version.
++ *
++ * Samsung multi-sources the A72 touchscreen: a given phone has exactly ONE of
++ * the two ICs, both on GENI I2C7 (0x00a84000), IRQ on TLMM 9, AVDD on
++ * pm6150l_l7. This driver probes both addresses at boot and binds the one
++ * that answers with a valid chip ID, then delivers multitouch as HID
++ * digitizer events through Bergamota's HID path (sweet_hid_touch).
++ *
++ * Structure mirrors Bergamota's bsd/dev/sweet_touch.c (patches 0060 "keys and
++ * touch drivers", 0062 "RPMh rail vote", 0063 "GENI FIFO packing fix"):
++ * the GENI FIFO engine, clock/GPIO setup, probe-dispatcher pattern and the
++ * touch_report() mask logic are carried over; only the IC protocols are new.
++ *
++ * Ported from ios-a72q/xnu/patches/a72q/a72q_touch.c (xnu-8796).
++ * Changes for xnu-11215:
++ *  - sweet_hid_touch() -> sweet_hid_touch() (defined in 0058, unchanged API)
++ *  - sweet_rpmh_vreg_enable() -> sweet_rpmh_vreg_enable() (defined in 0062)
++ *  - All protocol logic, GENI engine, and probe dispatcher unchanged.
++ *
++ * Protocol sources (see docs/touch-driver.md for the full mapping):
++ *  - Zinitix: drivers/input/touchscreen/zinitix/zt7650/{zinitix_ts.c,
++ *    zinitix_ts.h} in LineageOS/android_kernel_samsung_sm7125 (Samsung's
++ *    opensource kernel). 16-bit LE register addressing; chip code 0xE650 at
++ *    VCMD_ID 0xCC00; point data at 0x0200/0x0201, 16-byte records.
++ *  - STM FTS: drivers/input/touchscreen/stm/fts5cu56a/{fts_ts.c, fts_ts.h}
++ *    in the same tree. 8-bit register addressing; ID 0x48/0x36 at reg 0x22;
++ *    16-byte events at 0x60/0x61.
++ *
++ * ASSUMPTIONS (all marked ASSUMPTION in docs/touch-driver.md):
++ *  - RPMh resource name "ldol7" (sweet used "ldoc11" for PM6150L LDO11).
++ *  - GENI SE7 clock/GCC addresses carried from sweet (SM7150); SM7125's
++ *    sc7180 GCC is assumed compatible.
++ *  - I2C SDA/SCL pin mux (6/7) carried from sweet; ABL leaves them muxed.
++ *
++ * Call once after the scheduler is running; all work runs on one thread.
++ */
++#if defined(ARM64_BOARD_CONFIG_A72Q)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++/* Mach MIG declaration is not included by BSD's exported thread.h. */
++extern kern_return_t thread_terminate(thread_t);
++/* Bergamota xnu-11215: defined in 0062 (sweet-touch-power-battery) and
++ * 0058 (sweet-hid-event-services). Same API as xnu-8796. */
++extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++void a72q_touch_init(void);
++
++/* ---- SoC addresses (GENI SE7; same bus as sweet) ---- */
++#define TOUCH_SE_PA      0x00a84000u
++#define TOUCH_GCC_PA     0x00100000u
++#define TOUCH_NORTH_PA   0x03900000u /* DT TLMM + NORTH (0x500000) */
++#define TOUCH_GCC_VOTE   0x5200cu
++#define TOUCH_RCG        0x18148u    /* wrapper1 LOCAL S1 = global SE7 */
++#define TOUCH_GPIO_CFG(n) ((uint32_t)(n) * 0x1000u)
++#define TOUCH_GPIO_IO(n)  (TOUCH_GPIO_CFG(n) + 4u)
++
++/* ---- a72q touch GPIOs (from atoll-sec-a72q-input-common.dtsi) ---- */
++#define TOUCH_GPIO_RESET 8u   /* TLMM 8, panel/touch reset */
++#define TOUCH_GPIO_IRQ   9u   /* TLMM 9, touch interrupt */
++/* NOTE: sweet also drove TLMM 90 (board digital power enable). The a72q dts
++ * shows no equivalent GPIO; the AVDD rail is handled via the RPMh vote. */
++
++/* ---- IC identities ---- */
++#define TOUCH_ZINITIX    1
++#define TOUCH_STM        2
++#define ZINITIX_ADDR     0x20u
++#define STM_ADDR         0x49u
++#define TOUCH_MAX        10u
++
++/* Zinitix ZT7650 registers (16-bit LE addressing) */
++#define ZT_VCMD_ID       0xCC00u
++#define ZT_CHIP_CODE     0xE650u
++#define ZT_SWRESET_CMD   0x0000u
++#define ZT_CLEAR_INT     0x0003u
++#define ZT_POINT_REG     0x0200u
++#define ZT_POINT_REG1    0x0201u
++#define ZT_REC_LEN       16u
++
++/* STM FTS5CU56A registers (8-bit addressing) */
++#define FTS_REG_ID       0x22u
++#define FTS_ID0          0x48u
++#define FTS_ID1          0x36u
++#define FTS_CMD_SENSE_ON 0x10u
++#define FTS_CMD_CLR_EV   0x62u
++#define FTS_READ_ONE_EV  0x60u
++#define FTS_READ_ALL_EV  0x61u
++#define FTS_EV_LEN       16u
++#define FTS_ACT_NONE     0u
++#define FTS_ACT_PRESS    1u
++#define FTS_ACT_MOVE     2u
++#define FTS_ACT_RELEASE  3u
++
++/* ---- GENI SE registers (from sweet 0060/0063) ---- */
++#define SE_STATUS       0x040u
++#define SE_MCLK         0x048u
++#define SE_FW           0x068u
++#define SE_CLK_SEL      0x07cu
++#define SE_DMA          0x258u
++#define SE_TX_LEN       0x26cu
++#define SE_RX_LEN       0x270u
++#define SE_SCL          0x278u
++#define SE_CMD          0x600u
++#define SE_CTRL         0x604u
++#define SE_IRQ          0x610u
++#define SE_IRQ_EN       0x614u
++#define SE_IRQ_CLR      0x618u
++#define SE_TX           0x700u
++#define SE_RX           0x780u
++#define SE_TX_COUNT     0x800u
++#define SE_RX_COUNT     0x804u
++#define SE_HW_TX        0xe24u
++#define SE_HW_RX        0xe28u
++#define SE_TX_WM        0x80cu
++#define SE_RX_WM_IRQ    (1u << 26)
++#define SE_RX_LAST      (1u << 27)
++#define SE_TX_WM_IRQ    (1u << 30)
++#define SE_DONE         (1u << 0)
++#define SE_NACK         (1u << 10)
++#define SE_ERRORS       (0x3eu | (1u << 9) | (1u << 10) | (1u << 12) | \
++                         (1u << 13) | (3u << 24) | (3u << 28))
++#define SE_EVENTS       (SE_DONE | SE_ERRORS | SE_RX_WM_IRQ | SE_RX_LAST | \
++                         SE_TX_WM_IRQ)
++/* geni_se_config_packing(8, 4, true, true, true): Linux 8-bit I2C packing. */
++#define SE_PACK0        0x0007f8feu
++#define SE_PACK1        0x000ffefeu
++/* FIFO is 32 words = 128 bytes; multi-record reads are chunked to this. */
++#define SE_FIFO_BYTES   128u
++
++static struct {
++	vm_offset_t se, gcc, gpio;
++	bool started, dead, probing;
++	int kind, irq_hint;
++	uint32_t irq_status, irq_last, active;
++	unsigned sent, got;
++	int x[TOUCH_MAX], y[TOUCH_MAX];
++} st;
++static int touch_sleep_chan;
++
++static uint32_t
++touch_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++touch_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++touch_wait(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&touch_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static bool
++touch_wait_clear(vm_offset_t base, uint32_t off, uint32_t mask)
++{
++	for (unsigned i = 0; i < 5000; ++i) {
++		if (!(touch_rd(base, off) & mask)) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static void
++touch_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive,
++    bool out, bool high)
++{
++	uint32_t off = TOUCH_GPIO_CFG(pin);
++	uint32_t cfg = touch_rd(st.gpio, off);
++	if (out) {
++		/* Set the desired latch before enabling output (reset is active low). */
++		touch_wr(st.gpio, TOUCH_GPIO_IO(pin),
++		    (touch_rd(st.gpio, TOUCH_GPIO_IO(pin)) & ~2u) | (high ? 2u : 0u));
++	}
++	cfg &= ~0x3ffu;
++	cfg |= (mux << 2) | pull | (drive << 6) | (out ? 0x200u : 0u);
++	touch_wr(st.gpio, off, cfg);
++}
++
++static bool
++touch_clocks(void)
++{
++	/* Vote on only wrapper1 and SE7, preserving other clock users. */
++	uint32_t mask = (0x0fu << 18) | (1u << 23);
++	touch_wr(st.gcc, TOUCH_GCC_VOTE, touch_rd(st.gcc, TOUCH_GCC_VOTE) | mask);
++	uint32_t dfs = touch_rd(st.gcc, TOUCH_RCG + 0x14u);
++	uint32_t cfg = touch_rd(st.gcc, TOUCH_RCG + 4u);
++	printf("A72Q TOUCH: gcc vote=%#x rcg=%#x cfg=%#x dfs=%#x\n",
++	    touch_rd(st.gcc, TOUCH_GCC_VOTE), touch_rd(st.gcc, TOUCH_RCG), cfg, dfs);
++	if (dfs & 1u) {
++		/* SE CLK_SEL=0 selects DFS performance level 0. Do not alter tables. */
++		cfg = touch_rd(st.gcc, TOUCH_RCG + 0x1cu);
++		if ((cfg & 0x371fu) != 1u) {
++			printf("A72Q TOUCH: DFS level0=%#x is not XO/1; need clock integration\n", cfg);
++			return false;
++		}
++	} else {
++		/* XO parent 0, HID divider 1 => 19.2 MHz. No PLL or voltage change. */
++		cfg = (cfg & ~(0x371fu | (1u << 20))) | 1u;
++		touch_wr(st.gcc, TOUCH_RCG + 4u, cfg);
++		touch_wr(st.gcc, TOUCH_RCG, touch_rd(st.gcc, TOUCH_RCG) | 1u);
++		if (!touch_wait_clear(st.gcc, TOUCH_RCG, 1u)) {
++			printf("A72Q TOUCH: RCG update timeout\n");
++			return false;
++		}
++	}
++	const uint32_t branches[] = {0x18004, 0x18008, 0x1800c, 0x18010, 0x18144};
++	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
++		if (!touch_wait_clear(st.gcc, branches[i], 1u << 31)) {
++			printf("A72Q TOUCH: GCC branch %#x halted (%#x)\n", branches[i],
++			    touch_rd(st.gcc, branches[i]));
++			return false;
++		}
++	}
++	return true;
++}
++
++/* Called only for a transfer started by this driver, including a stretched TX. */
++static void
++touch_abort(void)
++{
++	touch_wr(st.se, SE_CTRL, 2); /* abort M command, release held bus */
++	bool done = false;
++	for (unsigned i = 0; i < 5000; ++i) {
++		if (touch_rd(st.se, SE_IRQ) & (1u << 5)) {
++			done = true;
++			break;
++		}
++		delay(1);
++	}
++	if (!done || !touch_wait_clear(st.se, SE_STATUS, 1u)) {
++		st.dead = true;
++		printf("A72Q TOUCH: abort failed status=%#x irq=%#x; stopping\n",
++		    touch_rd(st.se, SE_STATUS), touch_rd(st.se, SE_IRQ));
++	}
++	/* Bound drain even if the hardware reports an impossible FIFO count. */
++	for (unsigned i = 0; i < 64 && (touch_rd(st.se, SE_RX_COUNT) & 0x1ffffffu); ++i) {
++		(void)touch_rd(st.se, SE_RX);
++	}
++	touch_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
++	if (touch_rd(st.se, SE_TX_COUNT) & 0xfffffffu) {
++		st.dead = true;
++		printf("A72Q TOUCH: TX FIFO not empty after abort; stopping\n");
++	}
++}
++
++/* Keep all observed bits for diagnostics, even if a watermark was cleared. */
++static uint32_t
++touch_irq(void)
++{
++	st.irq_last = touch_rd(st.se, SE_IRQ);
++	st.irq_status |= st.irq_last;
++	return st.irq_last;
++}
++
++/* One Linux-style FIFO message. TX is at most 3 bytes; RX at most 128. */
++static int
++touch_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
++    unsigned nr, bool stretch)
++{
++	if (st.dead || nt > 3 || nr > SE_FIFO_BYTES || (nt && nr) || (!nt && !nr)) {
++		return EIO;
++	}
++	if (!touch_wait_clear(st.se, SE_STATUS, 1u)) {
++		st.dead = true; /* no other SE7 owner is supported */
++		return EBUSY;
++	}
++	touch_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
++	touch_wr(st.se, SE_TX_WM, nt ? 1u : 0u);
++	touch_wr(st.se, nr ? SE_RX_LEN : SE_TX_LEN, nr ? nr : nt);
++	touch_wr(st.se, SE_CMD, ((nr ? 2u : 1u) << 27) |
++	    ((uint32_t)addr << 9) | (stretch ? 4u : 0u));
++	int err = ETIMEDOUT;
++	for (unsigned i = 0; i < 20000; ++i) {
++		uint32_t irq = touch_irq();
++		if (irq & SE_ERRORS) {
++			err = (irq & SE_NACK) ? ENXIO : EIO;
++			/* A completed NACK is normal during address probing. Aborting an
++			 * idle sequencer may never produce ABORT_DONE. Wait for completion
++			 * and leave a clean idle engine available for the other IC. */
++			for (unsigned j = 0; j < 5000 && !(irq & SE_DONE); ++j) {
++				delay(1);
++				irq = touch_irq();
++			}
++			if ((irq & SE_DONE) && !(touch_rd(st.se, SE_STATUS) & 1u) &&
++			    !(touch_rd(st.se, SE_TX_COUNT) & 0xfffffffu) &&
++			    !(touch_rd(st.se, SE_RX_COUNT) & 0x1ffffffu)) {
++				touch_wr(st.se, SE_IRQ_CLR, irq);
++				return err;
++			}
++			break;
++		}
++		if (nt && !st.sent && (irq & SE_TX_WM_IRQ)) {
++			uint32_t word = 0;
++			for (unsigned j = 0; j < nt; ++j) {
++				word |= (uint32_t)tx[j] << (8u * j);
++			}
++			touch_wr(st.se, SE_TX, word);
++			st.sent = nt;
++			touch_wr(st.se, SE_TX_WM, 0);
++		}
++		uint32_t count = touch_rd(st.se, SE_RX_COUNT) & 0x1ffffffu;
++		if (count > 64 || count > (nr - st.got + 3u) / 4u) {
++			err = EIO;
++			break;
++		}
++		while (count--) {
++			uint32_t word = touch_rd(st.se, SE_RX);
++			for (unsigned j = 0; j < 4 && st.got < nr; ++j) {
++				rx[st.got++] = (uint8_t)(word >> (8u * j));
++			}
++		}
++		/* DONE is checked after draining RX, so final short words aren't lost. */
++		if (irq & SE_DONE) {
++			/* Re-sample after the final drain; a late error must beat DONE. */
++			irq = touch_irq();
++			if (irq & SE_ERRORS) {
++				continue;
++			}
++			touch_wr(st.se, SE_IRQ_CLR, irq);
++			if (st.got == nr && st.sent == nt) {
++				return 0;
++			}
++			err = EIO;
++			break;
++		}
++		/* Preserve DONE/errors if they arrive during this iteration. */
++		touch_wr(st.se, SE_IRQ_CLR, irq & (SE_RX_WM_IRQ | SE_RX_LAST | SE_TX_WM_IRQ));
++		delay(1);
++	}
++	touch_abort();
++	return err;
++}
++
++static int
++touch_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
++    unsigned nr, bool stretch)
++{
++	st.irq_status = st.irq_last = 0;
++	st.sent = st.got = 0;
++	int err = touch_msg_run(addr, tx, nt, rx, nr, stretch);
++	if (st.probing) {
++		printf("A72Q TOUCH: probe xfer addr=%#x %s len=%u stretch=%u err=%d irq=%#x seen=%#x tx=%u rx=%u status=%#x\n",
++		    addr, nr ? "read" : "write", nr ? nr : nt, stretch ? 1u : 0u,
++		    err, st.irq_last, st.irq_status, st.sent, st.got,
++		    touch_rd(st.se, SE_STATUS));
++	}
++	return err;
++}
++
++/*
++ * Register read. Zinitix uses 16-bit LE register addresses (wide=true);
++ * STM FTS uses 8-bit addresses (wide=false).
++ * STOP_STRETCH on the pointer write retains the bus for a repeated START.
++ */
++static int
++touch_read(uint8_t addr, uint16_t reg, bool wide, uint8_t *buf, unsigned len)
++{
++	uint8_t ptr[2] = {(uint8_t)(reg >> 8), (uint8_t)reg};
++	int err = touch_msg(addr, wide ? ptr : ptr + 1, wide ? 2u : 1u,
++	    NULL, 0, true);
++	if (err) {
++		return err;
++	}
++	return touch_msg(addr, NULL, 0, buf, len, false);
++}
++
++/* Multi-record read chunked to the 128-byte FIFO (e.g. 10 x 16-byte records). */
++static int
++touch_read_chunked(uint8_t addr, uint16_t reg, bool wide,
++    uint8_t *buf, unsigned reclen, unsigned nrec, unsigned regstep)
++{
++	for (unsigned i = 0; i < nrec; ++i) {
++		int err = touch_read(addr, (uint16_t)(reg + i * regstep), wide,
++		    buf + i * reclen, reclen);
++		if (err) {
++			return err;
++		}
++	}
++	return 0;
++}
++
++/* Zinitix command: 16-bit value sent LE (matches write_cmd in zinitix_ts.c). */
++static int
++touch_zt_cmd(uint16_t cmd)
++{
++	uint8_t tx[2] = {(uint8_t)(cmd & 0xffu), (uint8_t)(cmd >> 8)};
++	return touch_msg(ZINITIX_ADDR, tx, sizeof(tx), NULL, 0, false);
++}
++
++/* STM command: single byte (matches the FTS driver's command writes). */
++static int
++touch_fts_cmd(uint8_t cmd)
++{
++	return touch_msg(STM_ADDR, &cmd, 1, NULL, 0, false);
++}
++
++/* ---- HID delivery (mask logic carried from sweet touch_report) ---- */
++static void
++touch_report(uint32_t mask, const int *x, const int *y)
++{
++	for (unsigned id = 0; id < TOUCH_MAX; ++id) {
++		uint32_t bit = 1u << id;
++		if (mask & bit) {
++			if (!(st.active & bit) || x[id] != st.x[id] || y[id] != st.y[id]) {
++				sweet_hid_touch((int)id, 1, x[id], y[id]);
++			}
++			st.x[id] = x[id];
++			st.y[id] = y[id];
++		} else if (st.active & bit) {
++			sweet_hid_touch((int)id, 0, st.x[id], st.y[id]);
++		}
++	}
++	st.active = mask;
++}
++
++/*
++ * Zinitix ZT7650 report path.
++ * From zinitix_ts.c ts_read_coord(): read ZT_POINT_STATUS_REG (one 16-byte
++ * point_info); byte00.eid==0 (COORDINATE_EVENT) means a touch frame;
++ * byte07.left_event (low nibble) = finger count; then read that many
++ * 16-byte records at ZT_POINT_STATUS_REG1. Per record: tid = byte00[5:2],
++ * touch_status = byte00[7:6] (0 = FINGER_NONE), x = (byte01<<4)|(byte03>>4),
++ * y = (byte02<<4)|(byte03&0x0f). 1080x2400 panel.
++ */
++static int
++touch_zinitix(void)
++{
++	uint8_t rec[ZT_REC_LEN];
++	int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0};
++	uint32_t mask = 0;
++	int err = touch_read(ZINITIX_ADDR, ZT_POINT_REG, true, rec, ZT_REC_LEN);
++	if (err) {
++		return err;
++	}
++	unsigned eid = rec[0] & 3u;
++	if (eid != 0u) {
++		return 0; /* not a coordinate frame: retain current contacts */
++	}
++	unsigned n = rec[7] & 15u;
++	if (n > TOUCH_MAX) {
++		return EIO;
++	}
++	for (unsigned i = 0; i < n; ++i) {
++		err = touch_read(ZINITIX_ADDR,
++		    (uint16_t)(ZT_POINT_REG1 + i), true, rec, ZT_REC_LEN);
++		if (err) {
++			return err;
++		}
++		unsigned tid = (rec[0] >> 2) & 15u;
++		unsigned tstatus = (rec[0] >> 6) & 3u;
++		if (tid >= TOUCH_MAX || tstatus == 0u) {
++			continue; /* FINGER_NONE or out of range */
++		}
++		unsigned px = ((unsigned)rec[1] << 4) | (rec[3] >> 4);
++		unsigned py = ((unsigned)rec[2] << 4) | (rec[3] & 15u);
++		if (px > 1079 || py > 2399) {
++			continue; /* corrupt record: skip, keep other fingers */
++		}
++		if (mask & (1u << tid)) {
++			continue; /* duplicate tid: keep first */
++		}
++		mask |= 1u << tid;
++		x[tid] = (int)px;
++		y[tid] = (int)py;
++	}
++	touch_report(mask, x, y);
++	return 0;
++}
++
++/*
++ * STM FTS5CU56A report path.
++ * From fts_ts.c fts_event_handler_type_b(): events are 16 bytes; read
++ * FTS_READ_ONE_EVENT (0x60); byte7[4:0] = left_event_count; remaining events
++ * come from FTS_READ_ALL_EVENT (0x61). Per event: eid = byte0[1:0]
++ * (0 = COORDINATE); tid = byte0[5:2]; tchsta = byte0[7:6] (0 none, 1 press,
++ * 2 move, 3 release); x = (byte1<<4)|(byte3>>4); y = (byte2<<4)|(byte3&0x0f).
++ */
++static int
++touch_fts(void)
++{
++	uint8_t ev[FTS_EV_LEN];
++	int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0};
++	uint32_t mask = 0;
++	int err = touch_read(STM_ADDR, FTS_READ_ONE_EV, false, ev, FTS_EV_LEN);
++	if (err) {
++		return err;
++	}
++	unsigned left = ev[7] & 31u;
++	if (left > TOUCH_MAX) {
++		left = TOUCH_MAX; /* bound a lying FIFO count */
++	}
++	for (unsigned e = 0; e <= left; ++e) {
++		if (e > 0) {
++			err = touch_read(STM_ADDR, FTS_READ_ALL_EV, false, ev, FTS_EV_LEN);
++			if (err) {
++				return err;
++			}
++		}
++		unsigned eid = ev[0] & 3u;
++		if (eid != 0u) {
++			continue; /* status/gesture events: ignored for now */
++		}
++		unsigned tid = (ev[0] >> 2) & 15u;
++		unsigned tchsta = (ev[0] >> 6) & 3u;
++		if (tid >= TOUCH_MAX || tchsta == FTS_ACT_NONE ||
++		    tchsta == FTS_ACT_RELEASE) {
++			continue;
++		}
++		unsigned px = ((unsigned)ev[1] << 4) | (ev[3] >> 4);
++		unsigned py = ((unsigned)ev[2] << 4) | (ev[3] & 15u);
++		if (px > 1079 || py > 2399) {
++			continue;
++		}
++		if (mask & (1u << tid)) {
++			continue;
++		}
++		mask |= 1u << tid;
++		x[tid] = (int)px;
++		y[tid] = (int)py;
++	}
++	touch_report(mask, x, y);
++	return 0;
++}
++
++static bool
++touch_se_init(void)
++{
++	uint32_t fw = touch_rd(st.se, SE_FW);
++	uint32_t tx = touch_rd(st.se, SE_HW_TX), rx = touch_rd(st.se, SE_HW_RX);
++	printf("A72Q TOUCH: se7 fw=%#x proto=%u status=%#x tx=%#x rx=%#x ios=%#x\n",
++	    fw, (fw >> 8) & 0xffu, touch_rd(st.se, SE_STATUS), tx, rx,
++	    touch_rd(st.se, 0x908));
++	if (((fw >> 8) & 0xffu) != 3u || (touch_rd(st.se, 0x64) & 1u) ||
++	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) != 32u ||
++	    ((tx >> 16) & 0x3fu) < 2u || ((rx >> 16) & 0x3fu) < 2u) {
++		printf("A72Q TOUCH: need ABL-loaded I2C firmware and 32-bit FIFOs; probes skipped\n");
++		return false;
++	}
++	if (touch_rd(st.se, SE_STATUS) & 0x1001u) {
++		printf("A72Q TOUCH: SE7 already busy; probes skipped\n");
++		return false;
++	}
++	touch_wr(st.se, 0xe18, 0); /* no GSI events */
++	touch_wr(st.se, 0xe1c, 0); /* mask external IRQ routing; poll local status */
++	touch_wr(st.se, 0x644, 0);
++	touch_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
++	touch_wr(st.se, 0x648, 0xffffffffu);
++	touch_wr(st.se, SE_DMA, 0);
++	touch_wr(st.se, 0x28, touch_rd(st.se, 0x28) | 0x7fu);
++	touch_wr(st.se, 0xe30, touch_rd(st.se, 0xe30) | 0x0fu);
++	touch_wr(st.se, 0x24, 0x7f);
++	touch_wr(st.se, 0x20, 1);
++	touch_wr(st.se, SE_CLK_SEL, 0);
++	touch_wr(st.se, SE_MCLK, (7u << 4) | 1u);
++	touch_wr(st.se, SE_SCL, (10u << 20) | (11u << 10) | 26u); /* 100 kHz */
++	/* Linux 8-bit I2C packing: MSB on the wire, LSB byte first in FIFO. */
++	touch_wr(st.se, 0x254, 0);
++	touch_wr(st.se, 0x260, SE_PACK0);
++	touch_wr(st.se, 0x264, SE_PACK1);
++	touch_wr(st.se, 0x284, SE_PACK0);
++	touch_wr(st.se, 0x288, SE_PACK1);
++	touch_wr(st.se, SE_TX_WM, 0);
++	touch_wr(st.se, 0x810, 0);
++	touch_wr(st.se, 0x814, ((rx >> 16) & 0x3fu) - 1u);
++	touch_wr(st.se, SE_IRQ_EN, SE_EVENTS);
++	printf("A72Q TOUCH: packing tx=%#x/%#x rx=%#x/%#x gran=%#x\n",
++	    touch_rd(st.se, 0x260), touch_rd(st.se, 0x264),
++	    touch_rd(st.se, 0x284), touch_rd(st.se, 0x288), touch_rd(st.se, 0x254));
++	if (touch_rd(st.se, 0x260) != SE_PACK0 || touch_rd(st.se, 0x264) != SE_PACK1 ||
++	    touch_rd(st.se, 0x284) != SE_PACK0 || touch_rd(st.se, 0x288) != SE_PACK1 ||
++	    touch_rd(st.se, 0x254) != 0) {
++		printf("A72Q TOUCH: packing readback mismatch; probes skipped\n");
++		return false;
++	}
++	if ((touch_rd(st.se, SE_TX_COUNT) & 0xfffffffu) ||
++	    (touch_rd(st.se, SE_RX_COUNT) & 0x1ffffffu)) {
++		printf("A72Q TOUCH: inherited FIFO data; probes skipped\n");
++		return false;
++	}
++	return true;
++}
++
++static void
++touch_thread(void *arg, wait_result_t result)
++{
++	unsigned delay_s = 45;
++	(void)arg;
++	(void)result;
++	/*
++	 * Start late (boot-arg a72qtouchdelay, seconds): if the bus access
++	 * below hangs the SoC, the persistent log and the GUI got there first.
++	 */
++	(void)PE_parse_boot_argn("a72qtouchdelay", &delay_s, sizeof(delay_s));
++	printf("A72Q TOUCH: starting in %u s\n", delay_s);
++	touch_wait(delay_s * 1000u);
++	printf("A72Q TOUCH: mapping GCC/TLMM/SE7\n");
++	st.gcc = ml_io_map(TOUCH_GCC_PA, 0x60000);
++	st.gpio = ml_io_map(TOUCH_NORTH_PA, 0x5b000);
++	st.se = ml_io_map(TOUCH_SE_PA, 0x4000);
++	if (!st.gcc || !st.gpio || !st.se) {
++		printf("A72Q TOUCH: MMIO mapping failed\n");
++		goto out;
++	}
++	if (!touch_clocks() || !touch_se_init()) {
++		goto out;
++	}
++	/*
++	 * Power: vote the touch AVDD rail through RPMh.
++	 * ASSUMPTION: resource name "ldol7" (sweet used "ldoc11" for PM6150L
++	 * LDO11; the a72q dts names this rail pm6150l_l7). The dts marks the
++	 * rail regulator-boot-on, so a failed vote is a warning, not fatal.
++	 */
++	touch_gpio(TOUCH_GPIO_IRQ, 0, 3, 3, false, false); /* IRQ input, pull-up */
++	touch_gpio(TOUCH_GPIO_RESET, 0, 3, 3, true, false); /* hold reset low */
++	int power_error = sweet_rpmh_vreg_enable("ldol7", 3000);
++	if (power_error) {
++		printf("A72Q TOUCH: RPMh ldol7 vote failed %d; continuing (rail is boot-on per dts)\n",
++		    power_error);
++	}
++	touch_wait(10); /* conservative rail settling; not a DT timing value */
++	/* ASSUMPTION: SE7 SDA/SCL on TLMM 6/7 carried from sweet; ABL muxes them. */
++	touch_gpio(6, 1, 0, 0, false, false);
++	touch_gpio(7, 1, 0, 0, false, false);
++	/* Reset pulse: low 2 ms, then high; exceeds vendor minimums. */
++	touch_gpio(TOUCH_GPIO_RESET, 0, 3, 3, true, false);
++	touch_wait(2);
++	touch_gpio(TOUCH_GPIO_RESET, 0, 3, 3, true, true);
++	touch_wait(300);
++
++	/*
++	 * Probe dispatcher: exactly one IC must answer.
++	 * Zinitix: 16-bit LE read of VCMD_ID (0xCC00) -> chip code 0xE650.
++	 * STM: 8-bit read of reg 0x22 (5 bytes) -> val[2]=0x48, val[3]=0x36.
++	 */
++	uint8_t zid[2] = {0}, sid[5] = {0};
++	st.probing = true;
++	int ze = touch_read(ZINITIX_ADDR, ZT_VCMD_ID, true, zid, sizeof(zid));
++	int se_ = touch_read(STM_ADDR, FTS_REG_ID, false, sid, sizeof(sid));
++	st.probing = false;
++	bool zinitix = !ze && zid[0] == 0x50u && zid[1] == 0xE6u;
++	bool stm = !se_ && sid[2] == FTS_ID0 && sid[3] == FTS_ID1;
++	printf("A72Q TOUCH: probe 0x20 err=%d id=%02x%02x; probe 0x49 err=%d id=%02x%02x%02x%02x%02x\n",
++	    ze, zid[0], zid[1], se_, sid[0], sid[1], sid[2], sid[3], sid[4]);
++	if (st.dead || zinitix == stm) {
++		printf("A72Q TOUCH: no unique supported IC (zinitix=%d stm=%d dead=%d); stopping\n",
++		    zinitix, stm, st.dead);
++		goto out;
++	}
++	st.kind = zinitix ? TOUCH_ZINITIX : TOUCH_STM;
++	/* Minimal per-IC init (no firmware upload; factory firmware is on the IC). */
++	if (zinitix) {
++		(void)touch_zt_cmd(ZT_SWRESET_CMD);
++		touch_wait(50);
++		for (unsigned i = 0; i < 5; ++i) {
++			(void)touch_zt_cmd(ZT_CLEAR_INT);
++			touch_wait(10);
++		}
++	} else {
++		(void)touch_fts_cmd(FTS_CMD_SENSE_ON);
++		touch_wait(50);
++		(void)touch_fts_cmd(FTS_CMD_CLR_EV);
++		touch_wait(10);
++	}
++	printf("A72Q TOUCH: selected %s, 1080x2400, poll=10ms irq-hint=%d\n",
++	    zinitix ? "Zinitix ZT7650" : "STM FTS5CU56A", st.irq_hint);
++	unsigned errors = 0, ticks = 0;
++	while (!st.dead) {
++		/* Optional IRQ hint still reads every 100ms, and always while down. */
++		if (!st.irq_hint || st.active || !(touch_rd(st.gpio, TOUCH_GPIO_IO(TOUCH_GPIO_IRQ)) & 1u) ||
++		    (++ticks % 10u) == 0) {
++			int err = st.kind == TOUCH_ZINITIX ? touch_zinitix() : touch_fts();
++			if (err) {
++				if ((errors++ % 100u) == 0) {
++					printf("A72Q TOUCH: report err=%d irq=%#x\n", err, st.irq_status);
++				}
++				if (errors == 10) {
++					touch_report(0, st.x, st.y); /* release after persistent bad reads */
++				}
++			} else {
++				errors = 0;
++			}
++		}
++		touch_wait(10);
++	}
++	touch_report(0, st.x, st.y);
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++a72q_touch_init(void)
++{
++	int enabled = 1;
++	thread_t thread;
++	if (st.started) {
++		return;
++	}
++	st.started = true;
++	(void)PE_parse_boot_argn("a72qtouch", &enabled, sizeof(enabled));
++	(void)PE_parse_boot_argn("a72qtouchirq", &st.irq_hint, sizeof(st.irq_hint));
++	if (!enabled) {
++		printf("A72Q TOUCH: disabled (a72qtouch=0)\n");
++		return;
++	}
++	kern_return_t kr = kernel_thread_start(touch_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("A72Q TOUCH: kernel_thread_start failed %d\n", kr);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_A72Q */
+diff --git a/bsd/dev/a72q_display_11215.c b/bsd/dev/a72q_display_11215.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..0000000000000000000000000000000000000000
+--- /dev/null
++++ b/bsd/dev/a72q_display_11215.c
+@@ -0,0 +1,456 @@
++/*
++ * A72Q TE-aware command-mode display push: Samsung S6E3FC3_AMS667YM01.
++ * Ported to xnu-11215 (Bergamota) from the xnu-8796 version.
++ *
++ * Sweet (Redmi Note 10 Pro) has a VIDEO-MODE panel: the display controller
++ * continuously scans out from the bootloader's framebuffer RAM, so XNU just
++ * writes pixels and they appear. Bergamota's patch 0056 ("throttled present")
++ * records each CoreAnimation swap and copies the composed frame into panel
++ * memory on a vsync timer (boot-arg sweetfb_hz, default 10 Hz).
++ *
++ * The A72's panel is DSI COMMAND MODE: it holds the image in its own GRAM
++ * and only updates when the host pushes a frame via DCS commands,
++ * synchronized to the panel's TE (tearing-effect) signal on TLMM 10.
++ * Writing pixels into RAM is NOT enough. This driver is the REWRITE of the
++ * 0056 present path for command mode.
++ *
++ * What carries over from Bergamota (0046/0056/0061):
++ *  - IOSurface + IOMobileFramebuffer (AppleCLCD) services (0046) — unchanged.
++ *  - swap() records the frame descriptor, sets dirty, returns fast (0056).
++ *  - 1125x2436 iPhone-X presentation size (0061) — unchanged.
++ *  - Boot-args a72qfb_noconsole / a72qfb_hz (a72q-specific).
++ *
++ * Ported from ios-a72q/xnu/patches/a72q/a72q_display.c (xnu-8796).
++ * Changes for xnu-11215: none to the driver logic — the DSI/TE/GPIO code
++ * is SoC-level and version-agnostic. The interface (a72q_display_*) is
++ * unchanged; the 0056 TWEAK patch for Bergamota will wire it up.
++ *
++ * What is new here (vs Bergamota's 0056):
++ *  - A TE thread polls TLMM 10 for the panel's TE rising edge. On each edge,
++ *    if a new frame is dirty and the hz gate allows, it pushes the staged
++ *    framebuffer via DSI DCS commands (0x2A/0x2B column+page address, then
++ *    0x2C write_memory_start with the pixels). Between pushes the panel
++ *    self-refreshes from GRAM — no re-push needed when nothing changed.
++ *  - The composed frame comes from a staging buffer: the bootloader's
++ *    cont-splash framebuffer RAM (address runtime-discovered from the live
++ *    FDT). The adapted AppleCLCD::present() keeps Bergamota's layer-copy
++ *    code writing into that buffer, then calls a72q_display_mark_dirty().
++ *    The vsync timer is NOT used on a72q.
++ *
++ * Interface (called from the adapted AppleCLCD, future 0056 TWEAK):
++ *  - a72q_display_init()            — boot-args, map TLMM+DSI, TE GPIO in,
++ *                                     start the TE thread. Call once at boot.
++ *  - a72q_display_set_framebuffer(vm_offset_t phys, uint32_t bytes)
++ *                                   — staging buffer address (from ADT/FDT).
++ *  - a72q_display_set_compose(a72q_compose_fn fn)
++ *                                   — AppleCLCD registers its compose step
++ *                                     (the layer-copy body of present()).
++ *  - a72q_display_mark_dirty()      — AppleCLCD calls after composing.
++ *  - a72q_display_push_now()        — synchronous failsafe push (bring-up).
++ *
++ * SOURCES (see docs/display-driver.md for the full design notes):
++ *  - TE = TLMM 10, reset = TLMM 8, vci = pm6150_l18, vddi = pm6150_l13:
++ *    arch/arm64/boot/dts/samsung/drivers/atoll-sec-a72q-display-r00.dtsi
++ *    (Samsung opensource kernel, LineageOS/android_kernel_samsung_sm7125).
++ *  - Panel S6E3FC3_AMS667YM01, 1080x2400, 90 Hz, dsi_cmd_mode:
++ *    docs/a72q-hardware-facts.md (from Samsung's panel driver dtsi).
++ *  - DSI0 controller @ 0x0ae94000: arch/arm64/boot/dts/qcom/sc7180.dtsi
++ *    (mdss_dsi0: dsi@ae94000, reg <0 0x0ae94000 0 0x400>).
++ *  - DCS commands 0x2A/0x2B/0x2C: MIPI DCS standard (not Samsung-specific).
++ *  - TLMM base 0x03900000, GPIO_CFG(n)=n*0x1000, GPIO_IO(n)=n*0x1000+4:
++ *    carried from a72q_touch.c (same SoC family).
++ *  - Cont-splash framebuffer precondition: mainline sm7125-samsung patch
++ *    cover letter ("Framebuffer uses cont_splash_mem").
++ *
++ * ASSUMPTIONS (all marked ASSUMPTION in docs/display-driver.md):
++ *  - DSI command-DMA register offsets: follow Qualcomm's MDSS DSI
++ *    programming model; exact SM7125 offsets UNVERIFIED (no DSI headers in
++ *    the Samsung kernel tree). First hardware test must validate via DSI
++ *    status readback.
++ *  - TE polarity: rising edge = start of panel blanking (panel drives high).
++ *  - Pixel format: framebuffer bytes pushed as-is (bootloader configured
++ *    panel + framebuffer consistently); A72Q_FB_BPP=4 default, 2 = fallback.
++ *  - DSI link left active by bootloader (clocks on); we never re-init DSI.
++ *  - Panel holds GRAM between pushes (standard command-mode behavior).
++ */
++#if defined(ARM64_BOARD_CONFIG_A72Q)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++
++/* ---- SoC addresses ---- */
++#define DISP_TLMM_PA     0x03900000u /* carried from a72q_touch.c */
++#define DISP_DSI0_PA     0x0ae94000u /* sc7180.dtsi: mdss_dsi0 */
++#define DISP_DSI0_SIZE   0x1000u
++#define DISP_GPIO_CFG(n) ((uint32_t)(n) * 0x1000u)
++#define DISP_GPIO_IO(n)  (DISP_GPIO_CFG(n) + 4u)
++
++/* ---- a72q panel facts (Samsung dts + hardware facts doc) ---- */
++#define DISP_TE_GPIO     10u   /* qcom,platform-te-gpio = <&tlmm 10 0> */
++#define DISP_RESET_GPIO  8u    /* qcom,platform-reset-gpio = <&tlmm 8 0> */
++#define DISP_WIDTH       1080u
++#define DISP_HEIGHT      2400u
++#define DISP_BPP         4u    /* ASSUMPTION: pushed as-is; try 2 if colors wrong */
++#define DISP_FRAME_BYTES ((uint32_t)DISP_WIDTH * DISP_HEIGHT * DISP_BPP)
++
++/* ---- MIPI DCS commands (standard) ---- */
++#define DCS_SET_COLUMN_ADDRESS 0x2Au
++#define DCS_SET_PAGE_ADDRESS   0x2Bu
++#define DCS_WRITE_MEMORY_START 0x2Cu
++
++/*
++ * ---- DSI command-DMA register offsets: ASSUMPTION ----
++ * These follow Qualcomm's MDSS DSI controller programming model
++ * (command-mode DMA: status, DMA control, command offset/length, trigger).
++ * The SM7125 DSI revision's EXACT offsets are UNVERIFIED — no DSI headers
++ * exist in the Samsung kernel tree. First hardware test: read back
++ * DSI_STATUS before/after a push and compare against the expected
++ * idle/busy transitions; if they don't match, THESE OFFSETS ARE WRONG
++ * and must be re-derived (ideally from a live register dump under Linux).
++ */
++#define DSI_STATUS            0x008u  /* ASSUMPTION: bit0 = cmd DMA busy */
++#define DSI_CMD_MODE_DMA_CTRL 0x140u  /* ASSUMPTION */
++#define DSI_DMA_CMD_OFFSET    0x144u  /* ASSUMPTION: source phys addr */
++#define DSI_DMA_CMD_LENGTH    0x148u  /* ASSUMPTION: transfer length */
++#define DSI_CMD_TRIG          0x14Cu  /* ASSUMPTION: write 1 to kick */
++#define DSI_STATUS_CMD_BUSY   (1u << 0)
++
++typedef void (*a72q_compose_fn)(void);
++
++static struct {
++	bool            started;
++	bool            enabled;
++	vm_offset_t     tlmm;      /* mapped TLMM base */
++	vm_offset_t     dsi;       /* mapped DSI0 base */
++	vm_offset_t     fb_phys;   /* staging framebuffer phys addr (from FDT) */
++	uint32_t        fb_bytes;
++	uint32_t        hz;        /* push rate cap from a72qfb_hz */
++	uint64_t        last_push; /* mach_absolute_time of last push */
++	bool            dirty;
++	a72q_compose_fn compose;
++	int             pushes;
++	int             te_timeouts;
++} st;
++static int disp_sleep_chan;
++
++void a72q_display_init(void);
++void a72q_display_set_framebuffer(vm_offset_t phys, uint32_t bytes);
++void a72q_display_set_compose(a72q_compose_fn fn);
++void a72q_display_mark_dirty(void);
++int  a72q_display_push_now(void);
++
++static uint32_t
++disp_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++disp_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++disp_msleep(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&disp_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* Configure a TLMM pin: mirror of touch_gpio() in a72q_touch.c. */
++static void
++disp_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive,
++    bool out, bool high)
++{
++	uint32_t off = DISP_GPIO_CFG(pin);
++	uint32_t cfg = disp_rd(st.tlmm, off);
++	if (out) {
++		disp_wr(st.tlmm, DISP_GPIO_IO(pin),
++		    (disp_rd(st.tlmm, DISP_GPIO_IO(pin)) & ~2u) | (high ? 2u : 0u));
++	}
++	cfg &= ~0x3ffu;
++	cfg |= (mux << 2) | pull | (drive << 6) | (out ? 0x200u : 0u);
++	disp_wr(st.tlmm, off, cfg);
++}
++
++static bool
++disp_te_level(void)
++{
++	return (disp_rd(st.tlmm, DISP_GPIO_IO(DISP_TE_GPIO)) & 1u) != 0;
++}
++
++/*
++ * Wait for a TE rising edge, polling at ~1ms granularity (same pragmatic
++ * pattern as the touch driver's IRQ polling — no GIC wiring needed for
++ * bring-up). Returns true on edge, false on timeout.
++ *
++ * The timeout is a deliberate failsafe: if TE polarity is wrong, the panel
++ * stops pulsing, or TLMM 10 isn't the TE line on this unit, we must NOT
++ * hang the display thread forever — a stuck thread means a frozen screen
++ * with no kernel log visible. Callers push anyway on timeout (best effort).
++ */
++static bool
++disp_te_wait_rising(unsigned timeout_ms)
++{
++	bool prev = disp_te_level();
++	for (unsigned i = 0; i < timeout_ms; ++i) {
++		delay(1000); /* 1 ms */
++		bool cur = disp_te_level();
++		if (!prev && cur) {
++			return true;
++		}
++		prev = cur;
++	}
++	return false;
++}
++
++static bool
++disp_dsi_idle(void)
++{
++	for (unsigned i = 0; i < 5000; ++i) {
++		if (!(disp_rd(st.dsi, DSI_STATUS) & DSI_STATUS_CMD_BUSY)) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++/*
++ * Send one DCS command via the DSI command DMA engine.
++ * cmd: DCS command byte. payload/payload_len: parameters (may be NULL/0).
++ *
++ * ASSUMPTION: register offsets + trigger sequence follow Qualcomm's MDSS
++ * DSI programming model; UNVERIFIED on SM7125 (see banner above).
++ */
++static int
++disp_dsi_dcs(uint8_t cmd, const uint8_t *payload, uint32_t payload_len,
++    vm_offset_t dma_src, uint32_t dma_len)
++{
++	if (!disp_dsi_idle()) {
++		return -1;
++	}
++	/*
++	 * Long-write packet layout in the DMA buffer (built by the caller
++	 * in a small on-stack staging area is NOT possible for DMA — the
++	 * caller passes dma_src/dma_len for the pixel payload; short
++	 * commands go through the immediate path below).
++	 *
++	 * NOTE: this is the structural skeleton. The exact header packing
++	 * (data-type nibble, VC, word-count endianness) must be validated
++	 * against a DSI status readback on first hardware test.
++	 */
++	(void)dma_src;
++	(void)dma_len;
++	disp_wr(st.dsi, DSI_DMA_CMD_OFFSET, (uint32_t)dma_src);
++	disp_wr(st.dsi, DSI_DMA_CMD_LENGTH, dma_len);
++	/* Command byte goes through the DMA trigger path with its header. */
++	disp_wr(st.dsi, DSI_CMD_MODE_DMA_CTRL,
++	    0x00000001u | ((uint32_t)cmd << 8) | (payload_len << 16));
++	if (payload != NULL && payload_len > 0 && payload_len <= 4) {
++		uint32_t w = 0;
++		for (uint32_t i = 0; i < payload_len; ++i) {
++			w |= (uint32_t)payload[i] << (i * 8);
++		}
++		/* ASSUMPTION: immediate payload register follows the ctrl reg. */
++		disp_wr(st.dsi, DSI_CMD_MODE_DMA_CTRL + 4u, w);
++	}
++	disp_wr(st.dsi, DSI_CMD_TRIG, 1u);
++	return disp_dsi_idle() ? 0 : -2;
++}
++
++/*
++ * Push one full frame: set column/page address, then stream the pixels
++ * with write_memory_start. The panel latches the frame into GRAM on
++ * completion and self-refreshes until the next push.
++ */
++static int
++disp_push_frame(void)
++{
++	uint8_t col[4] = { 0x00, 0x00,
++	    (uint8_t)((DISP_WIDTH - 1) >> 8), (uint8_t)((DISP_WIDTH - 1) & 0xff) };
++	uint8_t page[4] = { 0x00, 0x00,
++	    (uint8_t)((DISP_HEIGHT - 1) >> 8), (uint8_t)((DISP_HEIGHT - 1) & 0xff) };
++	int err;
++
++	if (st.fb_phys == 0 || st.fb_bytes < DISP_FRAME_BYTES) {
++		printf("A72Q DISP: no framebuffer (phys=0x%llx bytes=%u)\n",
++		    (unsigned long long)st.fb_phys, st.fb_bytes);
++		return -3;
++	}
++	err = disp_dsi_dcs(DCS_SET_COLUMN_ADDRESS, col, 4, 0, 0);
++	if (err) {
++		return err;
++	}
++	err = disp_dsi_dcs(DCS_SET_PAGE_ADDRESS, page, 4, 0, 0);
++	if (err) {
++		return err - 10;
++	}
++	/* Long write: pixel payload streams straight from the staging fb. */
++	err = disp_dsi_dcs(DCS_WRITE_MEMORY_START, NULL, 0,
++	    st.fb_phys, DISP_FRAME_BYTES);
++	if (err) {
++		return err - 20;
++	}
++	return 0;
++}
++
++/*
++ * The TE thread: the heart of the command-mode rewrite. Sweet's vsync
++ * timer is gone; the panel's own TE signal paces us.
++ */
++static void
++display_thread(void *arg, wait_result_t wr)
++{
++#pragma unused(arg, wr)
++	uint64_t te_period_ns;
++	int errors = 0;
++
++	(void)PE_parse_boot_argn("a72qfb_hz", &st.hz, sizeof(st.hz));
++	if (st.hz == 0 || st.hz > 90) {
++		st.hz = 60; /* scaffold default; 90 Hz panel, 60 Hz push start */
++	}
++	te_period_ns = 1000000000ull / st.hz;
++	printf("A72Q DISP: TE thread up, push cap %u Hz (period %llu ns)\n",
++	    st.hz, te_period_ns);
++
++	for (;;) {
++		bool te = disp_te_wait_rising(100); /* 100 ms failsafe timeout */
++		uint64_t now = mach_absolute_time();
++		bool hz_ok = (now - st.last_push) >= te_period_ns;
++
++		if (!te) {
++			if ((++st.te_timeouts % 50u) == 0) {
++				printf("A72Q DISP: %d TE timeouts (polarity? wiring?); "
++				    "pushing anyway if dirty\n", st.te_timeouts);
++			}
++		}
++		if (st.dirty && (te || !hz_ok /* failsafe: don't stall */) && hz_ok) {
++			if (st.compose != NULL) {
++				st.compose(); /* layer-copy into staging fb */
++			}
++			int err = disp_push_frame();
++			st.last_push = mach_absolute_time();
++			if (err == 0) {
++				st.dirty = false;
++				st.pushes++;
++				errors = 0;
++				if ((st.pushes % 500) == 0) {
++					printf("A72Q DISP: %d pushes\n", st.pushes);
++				}
++			} else {
++				if ((++errors % 20) == 0) {
++					printf("A72Q DISP: push err=%d (%d total)\n",
++					    err, st.pushes);
++				}
++				/* Keep dirty: retry on the next TE. */
++			}
++		}
++	}
++	/* NOTREACHED */
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++a72q_display_set_framebuffer(vm_offset_t phys, uint32_t bytes)
++{
++	st.fb_phys = phys;
++	st.fb_bytes = bytes;
++	printf("A72Q DISP: staging fb phys=0x%llx bytes=%u\n",
++	    (unsigned long long)phys, bytes);
++}
++
++void
++a72q_display_set_compose(a72q_compose_fn fn)
++{
++	st.compose = fn;
++}
++
++void
++a72q_display_mark_dirty(void)
++{
++	st.dirty = true;
++}
++
++/* Synchronous failsafe push for bring-up: push current fb now, no TE wait. */
++int
++a72q_display_push_now(void)
++{
++	if (!st.enabled || st.fb_phys == 0) {
++		return -1;
++	}
++	if (st.compose != NULL) {
++		st.compose();
++	}
++	return disp_push_frame();
++}
++
++void
++a72q_display_init(void)
++{
++	int enabled = 1;
++	int noconsole = 1;
++	thread_t thread;
++
++	if (st.started) {
++		return;
++	}
++	st.started = true;
++	(void)PE_parse_boot_argn("a72qfb", &enabled, sizeof(enabled));
++	(void)PE_parse_boot_argn("a72qfb_noconsole", &noconsole, sizeof(noconsole));
++	if (!enabled) {
++		printf("A72Q DISP: disabled (a72qfb=0)\n");
++		return;
++	}
++	st.enabled = true;
++
++	st.tlmm = ml_io_map(DISP_TLMM_PA, 0x1000000u);
++	st.dsi = ml_io_map(DISP_DSI0_PA, DISP_DSI0_SIZE);
++	if (st.tlmm == 0 || st.dsi == 0) {
++		printf("A72Q DISP: io map failed\n");
++		st.enabled = false;
++		return;
++	}
++	/*
++	 * TE is panel-driven: input, no pull (carried from touch driver's
++	 * IRQ pattern). Do NOT touch reset (TLMM 8) — the bootloader owns
++	 * panel power/reset; asserting reset would kill the cont-splash
++	 * state we depend on.
++	 */
++	disp_gpio(DISP_TE_GPIO, 0, 3, 3, false, false);
++
++	if (noconsole) {
++		PE_Video video;
++		PE_current_console(&video);
++		PE_initialize_console(&video, kPEDisableScreen);
++	}
++
++	printf("A72Q DISP: init ok (TE=TLMM%u, DSI0=0x%x), waiting for "
++	    "framebuffer via a72q_display_set_framebuffer()\n",
++	    DISP_TE_GPIO, DISP_DSI0_PA);
++
++	kern_return_t kr = kernel_thread_start(display_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("A72Q DISP: kernel_thread_start failed %d\n", kr);
++		st.enabled = false;
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_A72Q */
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -48,6 +48,7 @@ extern void thread_deallocate(thread_t);
+ extern int hz;
+ static void sweet_log_start(void);
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
++extern void a72q_touch_init(void);
+ 
+ #define REG_CAP         0x00
+@@ -602,9 +603,10 @@ sweet_ufs_init(void)
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ 	sweet_log_start();
+ 	sweet_sample_start();
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+ 	sweet_keys_init();
+-	sweet_touch_init();
++	/* a72q: Zinitix/STM touch replaces sweet Goodix/Focaltech. */
++	a72q_touch_init();
+ 	return 0;
+ }

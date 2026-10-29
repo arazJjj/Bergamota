@@ -1,0 +1,71 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -122,6 +122,33 @@
+ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+ 
++/*
++ * A72Q command-mode display glue (bsd/dev/a72q_display_11215.c).
++ * The panel holds its image in GRAM and only updates on a TE-paced DSI
++ * push; there is no vsync timer. swap() records the frame and signals
++ * dirty; the TE thread composes (present) and pushes.
++ */
++extern "C" {
++void a72q_display_init(void);
++void a72q_display_set_framebuffer(vm_offset_t phys, uint32_t bytes);
++void a72q_display_set_compose(void (*fn)(void));
++void a72q_display_mark_dirty(void);
++}
++
++static AppleCLCD *gA72qFB;
++
++/* Compose shim: runs present() on the latest pending swap. C linkage for
++ * the a72q_display_11215.c callback type. */
++extern "C" static void
++a72q_compose_shim(void)
++{
++	AppleCLCD *fb = gA72qFB;
++	uint8_t rec[SWEET_FB_SWAP_REC_SIZE];
++	if (fb == NULL) {
++		return;
++	}
++	IOLockLock(fb->fLock);
++	memcpy(rec, fb->fPending, sizeof(rec));
++	IOLockUnlock(fb->fLock);
++	fb->present(rec);
++}
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -156,15 +183,21 @@
+ 		IOLog("SWEET FB: no vsync timer\n");
+ 		return false;
+ 	}
+-	uint32_t hz = 10;
+-	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+-	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+-	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
++
++	/*
++	 * A72Q command-mode: no vsync timer. The TE thread paces pushes; this
++	 * service composes into the staging framebuffer (the bootloader's
++	 * cont-splash RAM; fPhys came from boot_args->Video, which the shim
++	 * filled from the live FDT) and marks frames dirty.
++	 */
++	gA72qFB = this;
++	a72q_display_init();
++	a72q_display_set_framebuffer(fPhys, fRowBytes * fHeight);
++	a72q_display_set_compose(a72q_compose_shim);
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+@@ -240,8 +273,9 @@
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
+ 	IOLockUnlock(fLock);
++	a72q_display_mark_dirty();
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+ 	}
+ }
